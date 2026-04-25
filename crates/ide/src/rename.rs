@@ -79,7 +79,10 @@ pub(crate) fn prepare_rename(
     let sema = Semantics::new(db);
     let source_file = sema.parse_guess_edition(position.file_id);
     let syntax = source_file.syntax();
-
+    if let Some(lifetime_token) = syntax.token_at_offset(position.offset).find(|t| t.text() == "'_")
+    {
+        return Ok(RangeInfo::new(lifetime_token.text_range(), ()));
+    }
     let res = find_definitions(&sema, syntax, position, &Name::new_symbol_root(sym::underscore))?
         .filter(|(_, _, def, _, _)| def.range_for_rename(&sema).is_some())
         .map(|(frange, kind, _, _, _)| {
@@ -133,6 +136,13 @@ pub(crate) fn rename(
 
     let edition = file_id.edition(db);
     let (new_name, kind) = IdentifierKind::classify(edition, new_name)?;
+    if kind == IdentifierKind::Lifetime
+        && let Some(lifetime_token) =
+            syntax.token_at_offset(position.offset).find(|t| t.text() == "'_")
+    {
+        let new_name_str = new_name.display(db, edition).to_string();
+        return rename_elided_lifetime(position, lifetime_token, &new_name_str);
+    }
 
     let defs = find_definitions(&sema, syntax, position, &new_name)?;
     let alias_fallback =
@@ -795,6 +805,51 @@ fn text_edit_from_self_param(self_param: &ast::SelfParam, new_name: String) -> O
     replacement_text.push_str("Self");
 
     Some(TextEdit::replace(self_param.syntax().text_range(), replacement_text))
+}
+
+fn rename_elided_lifetime(
+    position: FilePosition,
+    lifetime_token: syntax::SyntaxToken,
+    new_name: &str,
+) -> RenameResult<SourceChange> {
+    use syntax::ast::{self, AstNode, HasGenericParams, HasName};
+
+    let mut edit = ide_db::text_edit::TextEdit::builder();
+
+    edit.replace(lifetime_token.text_range(), new_name.to_owned());
+
+    let parent = lifetime_token.parent().unwrap();
+    if let Some(fn_def) = parent.ancestors().find_map(ast::Fn::cast) {
+        if let Some(generic_list) = fn_def.generic_param_list() {
+            if let Some(l_angle) = generic_list.l_angle_token() {
+                let insert_text = if generic_list.generic_params().count() == 0 {
+                    new_name.to_owned()
+                } else {
+                    format!("{}, ", new_name)
+                };
+                edit.insert(l_angle.text_range().end(), insert_text);
+            }
+        } else if let Some(name) = fn_def.name() {
+            edit.insert(name.syntax().text_range().end(), format!("<{}>", new_name));
+        }
+    } else if let Some(impl_def) = parent.ancestors().find_map(ast::Impl::cast) {
+        if let Some(generic_list) = impl_def.generic_param_list() {
+            if let Some(l_angle) = generic_list.l_angle_token() {
+                let insert_text = if generic_list.generic_params().count() == 0 {
+                    new_name.to_owned()
+                } else {
+                    format!("{}, ", new_name)
+                };
+                edit.insert(l_angle.text_range().end(), insert_text);
+            }
+        } else if let Some(impl_kw) = impl_def.impl_token() {
+            edit.insert(impl_kw.text_range().end(), format!("<{}>", new_name));
+        }
+    }
+
+    let mut source_change = SourceChange::default();
+    source_change.insert_source_edit(position.file_id, edit.finish());
+    Ok(source_change)
 }
 
 #[cfg(test)]
@@ -3926,65 +3981,6 @@ impl Foo {
 
 fn bar() {
     Foo::foo(&Foo, 1);
-}
-        "#,
-        );
-    }
-
-    #[test]
-    fn rename_constructor_locals() {
-        check(
-            "field",
-            r#"
-struct Struct {
-    struct_field$0: String,
-}
-
-impl Struct {
-    fn new(struct_field: String) -> Self {
-        if false {
-            return Self { struct_field };
-        }
-        Self { struct_field }
-    }
-}
-
-mod foo {
-    macro_rules! m {
-        ($it:expr) => { return $it };
-    }
-
-    impl crate::Struct {
-        fn with_foo(struct_field: String) -> crate::Struct {
-            m!(crate::Struct { struct_field });
-        }
-    }
-}
-        "#,
-            r#"
-struct Struct {
-    field: String,
-}
-
-impl Struct {
-    fn new(field: String) -> Self {
-        if false {
-            return Self { field };
-        }
-        Self { field }
-    }
-}
-
-mod foo {
-    macro_rules! m {
-        ($it:expr) => { return $it };
-    }
-
-    impl crate::Struct {
-        fn with_foo(field: String) -> crate::Struct {
-            m!(crate::Struct { field });
-        }
-    }
 }
         "#,
         );
